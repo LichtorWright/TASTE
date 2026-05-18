@@ -1,0 +1,28 @@
+// Example TASTE source file
+// Demonstrates the TASTE source language: type definitions with fields and methods.
+//
+// Pipeline: Source Parser → MAST → AST → Emitter → Target Code
+//
+// To transpile this file to Python:
+//   python -c "
+//   from taste import TasteEngine
+//   engine = TasteEngine()
+//   print(engine.transpile(open('examples/person.taste').read(), target='python'))
+//   "
+
+type Person {
+    public name: string
+    public age: int
+    private secret_id: string
+
+    public fn greet(to: string) -> string
+    public fn get_age() -> int
+}
+
+type Employee extends Person {
+    public company: string
+    public salary: float
+
+    public fn get_salary() -> float
+    public fn set_salary(amount: float) -> void
+}
