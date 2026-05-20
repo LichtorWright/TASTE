@@ -1,0 +1,22 @@
+## Build outputs
+bin/
+obj/
+
+## Visual Studio
+.vs/
+*.user
+*.suo
+*.cache
+
+## IDE
+.vscode/
+.idea/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## .NET
+*.dll
+*.exe
+*.pdb
