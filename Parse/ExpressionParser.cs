@@ -89,12 +89,17 @@ namespace taste.Parse
         DotDot,         // ..
         DotDotEquals,   // ..=
 
+        // Db-specific operators
+        MoveArrow,      // <-
+        SwapArrow,      // <->
+
         // Brackets
         OpenParen,      // (
         CloseParen,     // )
         OpenBracket,    // [
         CloseBracket,   // ]
         OpenBrace,      // {
+        CloseBrace,     // }
 
         // Parameter modifier keywords (in argument position)
         OutKeyword,
@@ -102,6 +107,7 @@ namespace taste.Parse
         InKeyword,
 
         // Special
+        NameofKeyword,
         Eof
     }
 
@@ -167,6 +173,13 @@ namespace taste.Parse
                 // String literal
                 if (c == '"') { tokens.Add(ReadStringLiteral()); continue; }
                 if (c == '\'') { tokens.Add(ReadCharLiteral()); continue; }
+
+                // Interpolated string: $"..." — treat as a single string token with {expr} placeholders preserved
+                if (c == '$' && _pos + 1 < _source.Length && _source[_pos + 1] == '"')
+                {
+                    tokens.Add(ReadInterpolatedStringLiteral());
+                    continue;
+                }
 
                 // Verbatim string @"..."
                 if (c == '@' && _pos + 1 < _source.Length && _source[_pos + 1] == '"')
@@ -267,6 +280,37 @@ namespace taste.Parse
             return new Token(TokenType.StringLiteral, sb.ToString(), start);
         }
 
+        /// <summary>
+        /// Reads an interpolated string literal $"..." preserving {expr} placeholders as-is.
+        /// The interpolation holes are kept in the string value for downstream processing.
+        /// Inside {}, backslashes are NOT escape characters (they're code).
+        /// </summary>
+        private Token ReadInterpolatedStringLiteral()
+        {
+            int start = _pos;
+            _pos += 2; // skip $"
+            var sb = new StringBuilder();
+            int braceDepth = 0;
+            while (_pos < _source.Length)
+            {
+                char ch = _source[_pos];
+                if (ch == '{') { braceDepth++; sb.Append(ch); _pos++; continue; }
+                if (ch == '}') { braceDepth--; sb.Append(ch); _pos++; continue; }
+                if (ch == '"' && braceDepth == 0) { _pos++; break; }
+                if (ch == '\\' && braceDepth == 0 && _pos + 1 < _source.Length)
+                {
+                    _pos++;
+                    sb.Append(EscapeChar(_source[_pos]));
+                    _pos++;
+                    continue;
+                }
+                // Inside interpolation holes, don't process escapes — they're code
+                sb.Append(ch);
+                _pos++;
+            }
+            return new Token(TokenType.StringLiteral, $"$\"{sb.ToString()}\"", start);
+        }
+
         private char EscapeChar(char c) => c switch
         {
             'n' => '\n', 'r' => '\r', 't' => '\t', '0' => '\0',
@@ -352,6 +396,7 @@ namespace taste.Parse
                 "typeof" => TokenType.TypeofKeyword,
                 "default" => TokenType.DefaultKeyword,
                 "sizeof" => TokenType.SizeofKeyword,
+                "nameof" => TokenType.NameofKeyword,
                 "with" => TokenType.WithKeyword,
                 "out" => TokenType.OutKeyword,
                 "ref" => TokenType.RefKeyword,
@@ -370,6 +415,7 @@ namespace taste.Parse
                 string tri = _source.Substring(_pos, 3);
                 var tt = tri switch
                 {
+                    "<->" => (TokenType.SwapArrow, 3),
                     "->*" => (TokenType.ArrowAsterisk, 3),
                     "?[]" => (TokenType.QuestionBracket, 3),
                     "..=" => (TokenType.DotDotEquals, 3),
@@ -389,6 +435,7 @@ namespace taste.Parse
                 string duo = _source.Substring(_pos, 2);
                 var tt = duo switch
                 {
+                    "<-" => (TokenType.MoveArrow, 2),
                     "::" => (TokenType.DoubleColon, 2),
                     "->" => (TokenType.Arrow, 2),
                     ".*" => (TokenType.DotAsterisk, 2),
@@ -446,6 +493,7 @@ namespace taste.Parse
             '[' => new Token(TokenType.OpenBracket, "[", _pos++),
             ']' => new Token(TokenType.CloseBracket, "]", _pos++),
             '{' => new Token(TokenType.OpenBrace, "{", _pos++),
+            '}' => new Token(TokenType.CloseBrace, "}", _pos++),
             '=' => new Token(TokenType.Assign, "=", _pos++),
             '<' => new Token(TokenType.LessThan, "<", _pos++),
             '>' => new Token(TokenType.GreaterThan, ">", _pos++),
@@ -554,6 +602,22 @@ namespace taste.Parse
                 var op = Advance();
                 var value = ParseAssignment(); // right-to-left
                 return new AssignmentExpression(expr, op.Value, value);
+            }
+
+            // Db-specific: move operator a <- b
+            if (Is(TokenType.MoveArrow))
+            {
+                Advance(); // skip <-
+                var value = ParseAssignment();
+                return new AssignmentExpression(expr, "<-", value);
+            }
+
+            // Db-specific: swap operator a <-> b
+            if (Is(TokenType.SwapArrow))
+            {
+                Advance(); // skip <->
+                var value = ParseAssignment();
+                return new AssignmentExpression(expr, "<->", value);
             }
 
             return expr;
@@ -1113,7 +1177,7 @@ namespace taste.Parse
                     if (Is(TokenType.OpenBrace))
                     {
                         Advance(); // skip {
-                        while (!Is(TokenType.CloseParen) && !Is(TokenType.Eof))
+                        while (!Is(TokenType.CloseBrace) && !Is(TokenType.Eof))
                         {
                             string propName = Advance().Value;
                             Advance(); // skip =
@@ -1121,8 +1185,7 @@ namespace taste.Parse
                             obj.NamedArgs.Add(new NamedArgument(propName, value));
                             if (!Match(TokenType.Comma)) break;
                         }
-                        // Skip closing brace — we don't have a CloseBrace token,
-                        // but object initializers end with } which we handle as Eof fallback
+                        if (Is(TokenType.CloseBrace)) Advance(); // skip }
                     }
 
                     return obj;
@@ -1169,6 +1232,16 @@ namespace taste.Parse
                 string typeName = ParseTypeName();
                 Advance(); // skip )
                 return new IdentifierExpression($"sizeof({typeName})");
+            }
+
+            // nameof(expr)
+            if (Is(TokenType.NameofKeyword))
+            {
+                Advance(); // skip nameof
+                Advance(); // skip (
+                var inner = ParseAssignment();
+                Advance(); // skip )
+                return new IdentifierExpression($"nameof({inner})");
             }
 
             // default(Type) or default

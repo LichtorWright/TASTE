@@ -229,6 +229,7 @@ namespace taste
         Async    = 1 << 5,
         Extern   = 1 << 6,
         New      = 1 << 7,   // hides base member
+        Partial  = 1 << 8,   // partial method
     }
 
     // â”€â”€ Attributes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -537,6 +538,9 @@ namespace taste
         public string            Name         { get; }
         public string            DelegateType { get; }
         public AccessModifier    Access       { get; set; }
+        public bool              IsStatic     { get; set; }
+        public bool              IsVirtual    { get; set; }
+        public bool              IsOverride  { get; set; }
         public bool              IsMulticast  { get; set; } = true;
         public List<SourceAttribute> Attributes   { get; } = new List<SourceAttribute>();
 
@@ -547,6 +551,7 @@ namespace taste
     {
         public string            Name       { get; }
         public AccessModifier    Access     { get; set; }
+        public string?           UnderlyingType { get; set; }
         public List<SourceAttribute> Attributes { get; } = new List<SourceAttribute>();
         public List<string>      Members    { get; } = new List<string>();
 
@@ -579,7 +584,11 @@ namespace taste
         public string?           Initializer { get; set; }
         public bool              IsStatic    { get; set; }
         /// <summary>readonly in C# â†’ can only be assigned in constructor; emits const in C++.</summary>
-        public bool              IsReadonly  { get; set; }        /// <summary>Mutability qualifiers: const, mutable, volatile, readonly.</summary>
+        public bool              IsReadonly  { get; set; }
+        /// <summary>True if this is a fixed-size buffer (unsafe context): <c>fixed int buffer[10];</c></summary>
+        public bool              IsFixed     { get; set; }
+        /// <summary>For fixed buffers, the size expression: <c>fixed int buffer[10];</c> → "10".</summary>
+        public string?           FixedSize   { get; set; }        /// <summary>Mutability qualifiers: const, mutable, volatile, readonly.</summary>
         public MutabilityModifier Mutability { get; set; }
         /// <summary>True if this field is lazily initialised on first access (backtick syntax).</summary>
         public bool              IsLazy      { get; set; }
@@ -604,6 +613,8 @@ namespace taste
         public bool              IsStatic   { get; set; }
         public bool              IsVirtual  { get; set; }
         public bool              IsOverride { get; set; }
+        public bool              IsAbstract { get; set; }
+        public bool              IsSealed   { get; set; }
         /// <summary>True if this is an indexer (this[...] in C#).</summary>
         public bool              IsIndexer  { get; set; }
         /// <summary>Parameters for indexer (e.g., "int index").</summary>
@@ -664,6 +675,8 @@ namespace taste
         public bool            IsConstructor { get; set; }
         /// <summary>True for destructors (~ClassName).</summary>
         public bool            IsDestructor  { get; set; }
+        /// <summary>True for explicit interface implementations (IMyInterface.Method).</summary>
+        public bool            IsExplicitInterfaceImplementation => Name.Contains(".");
 
         public List<string>          TypeParams       { get; } = new List<string>();
         public List<SourceAttribute>     Attributes       { get; } = new List<SourceAttribute>();
@@ -688,6 +701,8 @@ namespace taste
         public bool IsExtern   => Modifiers.HasFlag(MethodModifier.Extern);
         /// <summary>True when the method hides a base class member (C# 'new' keyword). Name hiding is implicit in C++.</summary>
         public bool IsNew      => Modifiers.HasFlag(MethodModifier.New);
+        /// <summary>True when the method is a partial method (no body, implementation may be elsewhere).</summary>
+        public bool IsPartial  => Modifiers.HasFlag(MethodModifier.Partial);
 
         /// <summary>Mutability qualifiers for this method (e.g. const, volatile).</summary>
         public MutabilityModifier Mutability { get; set; }
@@ -757,6 +772,8 @@ namespace taste
         public bool    IsInferred      { get; set; }
         /// <summary>Mutability qualifiers for local variables (e.g. const).</summary>
         public MutabilityModifier Mutability { get; set; }
+        /// <summary>Parameter modifier: ref, out, in, params.</summary>
+        public string? Modifier { get; set; }
         /// <summary>Source-level attributes on this variable (e.g. [Stack], [Heap], [Shared], [Raw]).</summary>
         public List<SourceAttribute> Attributes { get; } = new List<SourceAttribute>();
         /// <summary>Resolved allocation strategy for this local variable.
@@ -821,6 +838,12 @@ namespace taste
         // foreach-specific
         public Variable?        IterationVariable { get; set; }
         public string?          Collection        { get; set; }
+
+        // for-specific (decomposed from for(init; cond; incr))
+        /// <summary>For-loop initializer (e.g. "int i = 0"). Null if not a for-loop or not decomposed.</summary>
+        public string?          ForInitializer { get; set; }
+        /// <summary>For-loop increment (e.g. "++i"). Null if not a for-loop or not decomposed.</summary>
+        public string?          ForIncrement   { get; set; }
 
         public List<Statement> Body { get; } = new List<Statement>();
 
@@ -919,6 +942,28 @@ namespace taste
         public List<Statement> Body      { get; } = new List<Statement>();
 
         public CheckedBlock(bool isChecked) { IsChecked = isChecked; }
+    }
+
+    /// <summary>
+    /// An unsafe block: <c>unsafe { ... }</c>.
+    /// In C++, all code is "unsafe" — this is a no-op block that just emits its body.
+    /// </summary>
+    public class UnsafeBlock : Statement
+    {
+        public List<Statement> Body { get; } = new List<Statement>();
+    }
+
+    /// <summary>
+    /// A fixed statement: <c>fixed (int* p = &amp;arr[0]) { ... }</c>.
+    /// Pins a managed object in memory for the duration of the block.
+    /// In C++, this is a no-op — pointers are already stable.
+    /// </summary>
+    public class FixedStatement : Statement
+    {
+        public string            Declaration { get; }
+        public List<Statement>   Body        { get; } = new List<Statement>();
+
+        public FixedStatement(string declaration) { Declaration = declaration; }
     }
 
     // ── Additional statement nodes ───────────────────────────────────────────

@@ -175,6 +175,18 @@ namespace taste.Parse
         /// <summary>checked — overflow-checking context</summary>
         public const string Checked = "checked";
 
+        /// <summary>unchecked — no overflow-checking context</summary>
+        public const string Unchecked = "unchecked";
+
+        /// <summary>unsafe — unsafe context block</summary>
+        public const string Unsafe = "unsafe";
+
+        /// <summary>fixed — pins a variable in memory (unsafe context)</summary>
+        public const string Fixed = "fixed";
+
+        /// <summary>with — mixin composition (adds methods to existing type)</summary>
+        public const string With = "with";
+
         // ── Db-specific operator symbols ───────────────────────────────────────
 
         /// <summary>&lt;- — move semantics operator (transfers ownership)</summary>
@@ -226,7 +238,7 @@ namespace taste.Parse
         /// <summary>All control flow keywords that start a block.</summary>
         public static readonly HashSet<string> BlockKeywords = new()
         {
-            If, Unless, While, Do, For, Foreach, Repeat, Switch, Try, Using, Lock, Checked
+            If, Unless, While, Do, For, Foreach, Repeat, Switch, Try, Using, Lock, Checked, Unsafe, With
         };
 
         /// <summary>

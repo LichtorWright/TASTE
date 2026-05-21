@@ -58,6 +58,8 @@ namespace taste.Parse.Db
 
             while (!IsEndOfFile())
             {
+                try
+                {
                 string line = PeekLine()?.Trim();
                 if (string.IsNullOrWhiteSpace(line) || line.StartsWith("//"))
                 {
@@ -119,9 +121,19 @@ namespace taste.Parse.Db
                 {
                     file.Delegates.Add(ParseDelegate());
                 }
+                else if (StartsWithAccessAndKeyword(line, "with"))
+                {
+                    file.Mixins.Add(ParseMixin());
+                }
                 else
                 {
                     ConsumeLine(); // Skip unknown
+                }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DbParser] Skipping top-level construct due to parse error: {ex.Message}");
+                    ConsumeLine();
                 }
             }
 
@@ -138,6 +150,8 @@ namespace taste.Parse.Db
             
             while (!IsEndOfFile())
             {
+                try
+                {
                 string innerLine = PeekLine()?.Trim();
                 if (string.IsNullOrWhiteSpace(innerLine) || innerLine.StartsWith("//"))
                 {
@@ -197,8 +211,18 @@ namespace taste.Parse.Db
                 {
                     ns.Delegates.Add(ParseDelegate());
                 }
+                else if (StartsWithAccessAndKeyword(innerLine, "with"))
+                {
+                    ns.Mixins.Add(ParseMixin());
+                }
                 else
                 {
+                    ConsumeLine();
+                }
+                }
+                catch (Exception ex)
+                {
+                    System.Diagnostics.Debug.WriteLine($"[DbParser] Skipping namespace member due to parse error: {ex.Message}");
                     ConsumeLine();
                 }
             }
@@ -211,29 +235,30 @@ namespace taste.Parse.Db
             var classAttrs = CollectAttributes();
             
             string line = ConsumeLine().Trim();
-            var match = Regex.Match(line, @"^\s*(public|private|protected|internal|partial)?\s*(static\s+)?(sealed\s+)?(class|struct|stub)\s+(\w+)(?:<[^>]+>)?\s*(:\s*[^{]+)?\s*(\{)?");
+            var match = Regex.Match(line, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(sealed\s+)?(abstract\s+)?(readonly\s+)?(partial\s+)?(class|struct|stub)\s+(\w+)(?:<[^>]+>)?\s*(:\s*[^{]+)?\s*(\{)?");
             if (!match.Success) throw new Exception($"Invalid class declaration: {line}");
 
             // Stubs are IntelliSense-only declarations; skip them entirely at the reader level.
-            if (match.Groups[4].Value == "stub")
+            if (match.Groups[7].Value == "stub")
             {
-                if (match.Groups[7].Value == "{")
+                if (match.Groups[10].Value == "{")
                 {
                     int depth = 1;
                     while (!IsEndOfFile() && depth > 0)
                     {
                         string l = ConsumeLine();
-                        foreach (char ch in l) { if (ch == '{') depth++; else if (ch == '}') depth--; }
+                        depth += CountBraces(l);
                     }
                 }
                 return null;
             }
 
-            var cls = new Class(match.Groups[5].Value)
+            var cls = new Class(match.Groups[8].Value)
             {
-                IsStruct  = match.Groups[4].Value == "struct",
+                IsStruct  = match.Groups[7].Value == "struct",
                 IsStatic  = match.Groups[2].Success && match.Groups[2].Value.Trim() == "static",
-                IsSealed  = match.Groups[3].Success
+                IsSealed  = match.Groups[3].Success,
+                IsAbstract = match.Groups[4].Success
             };
 
             // Apply class-level attributes (e.g., [Represents("std::string")])
@@ -241,9 +266,9 @@ namespace taste.Parse.Db
                 cls.Attributes.Add(attr);
 
             // Handle inheritance
-            if (!string.IsNullOrEmpty(match.Groups[6].Value))
+            if (!string.IsNullOrEmpty(match.Groups[9].Value))
             {
-                string basesRaw = match.Groups[6].Value.TrimStart(':').Trim();
+                string basesRaw = match.Groups[9].Value.TrimStart(':').Trim();
                 foreach (var baseName in basesRaw.Split(','))
                 {
                     string trimmedBase = baseName.Trim();
@@ -253,7 +278,7 @@ namespace taste.Parse.Db
             }
 
             // If the opening brace wasn't on the same line, consume lines until we find it
-            if (match.Groups[7].Value != "{")
+            if (match.Groups[10].Value != "{")
             {
                 while (!IsEndOfFile())
                 {
@@ -270,6 +295,8 @@ namespace taste.Parse.Db
 
             while (!IsEndOfFile())
                 {
+                    try
+                    {
                     // Collect any attribute lines preceding the next member
                     var memberAttrs = CollectAttributes();
 
@@ -286,11 +313,11 @@ namespace taste.Parse.Db
                         break;
                     }
 
-                    // 1. Constants: const int Max = 100;
-                    var constMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*const\s+(\w+)\s+(\w+)\s*=\s*([^;]+);\s*$");
+                    // 1. Constants: const int Max = 100; or public static const int Max = 100;
+                    var constMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?const\s+(\w+)\s+(\w+)\s*=\s*([^;]+);\s*$");
                     if (constMatch.Success)
                     {
-                        var c = new Constant(constMatch.Groups[3].Value, constMatch.Groups[2].Value, constMatch.Groups[4].Value.Trim());
+                        var c = new Constant(constMatch.Groups[4].Value, constMatch.Groups[3].Value, constMatch.Groups[5].Value.Trim());
                         c.Access = ParseAccess(constMatch.Groups[1].Value);
                         foreach (var attr in memberAttrs) c.Attributes.Add(attr);
                         cls.Constants.Add(c);
@@ -326,16 +353,71 @@ namespace taste.Parse.Db
                         continue;
                     }
 
-                    // 2b. Fields: public int Health;
-                    var fieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(\w+)<[^>]*>\s+(\w+)\s*;\s*$"); // Generic
+                    // 2b. Readonly field: public readonly int X; or public static readonly int X = expr;
+                    var readonlyFieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?readonly\s+(\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*(?:=\s*([^;]+))?\s*;");
+                    if (readonlyFieldMatch.Success)
+                    {
+                        var f = new Field(readonlyFieldMatch.Groups[4].Value, readonlyFieldMatch.Groups[3].Value)
+                        {
+                            Access = ParseAccess(readonlyFieldMatch.Groups[1].Value),
+                            IsStatic = readonlyFieldMatch.Groups[2].Success,
+                            IsReadonly = true
+                        };
+                        if (readonlyFieldMatch.Groups[5].Success && !string.IsNullOrEmpty(readonlyFieldMatch.Groups[5].Value))
+                            f.Initializer = readonlyFieldMatch.Groups[5].Value.Trim();
+                        foreach (var attr in memberAttrs) f.Attributes.Add(attr);
+                        cls.Fields.Add(f);
+                        ConsumeLine();
+                        continue;
+                    }
+
+                    // 2b2. Volatile field: public volatile int X;
+                    var volatileFieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?volatile\s+(\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*(?:=\s*([^;]+))?\s*;");
+                    if (volatileFieldMatch.Success)
+                    {
+                        var f = new Field(volatileFieldMatch.Groups[4].Value, volatileFieldMatch.Groups[3].Value)
+                        {
+                            Access = ParseAccess(volatileFieldMatch.Groups[1].Value),
+                            IsStatic = volatileFieldMatch.Groups[2].Success,
+                            Mutability = MutabilityModifier.Volatile
+                        };
+                        if (volatileFieldMatch.Groups[5].Success && !string.IsNullOrEmpty(volatileFieldMatch.Groups[5].Value))
+                            f.Initializer = volatileFieldMatch.Groups[5].Value.Trim();
+                        foreach (var attr in memberAttrs) f.Attributes.Add(attr);
+                        cls.Fields.Add(f);
+                        ConsumeLine();
+                        continue;
+                    }
+
+                    // 2b3. Fixed buffer: public fixed int buffer[10];
+                    var fixedMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?fixed\s+(\w+)\s+(\w+)\s*\[([^\]]+)\]\s*;");
+                    if (fixedMatch.Success)
+                    {
+                        var f = new Field(fixedMatch.Groups[4].Value, fixedMatch.Groups[3].Value)
+                        {
+                            Access = ParseAccess(fixedMatch.Groups[1].Value),
+                            IsStatic = fixedMatch.Groups[2].Success,
+                            IsFixed = true,
+                            FixedSize = fixedMatch.Groups[5].Value.Trim()
+                        };
+                        foreach (var attr in memberAttrs) f.Attributes.Add(attr);
+                        cls.Fields.Add(f);
+                        ConsumeLine();
+                        continue;
+                    }
+
+                    // 2c. Fields: public int Health; or public static int Health = 42;
+                    var fieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(\w+)<[^>]*>\s+(\w+)\s*(?:=\s*([^;]+))?\s*;\s*$"); // Generic
                     if (!fieldMatch.Success)
-                        fieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(\w+)\s+(\w+)\s*;\s*$"); // Simple
+                        fieldMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(\w+)\s+(\w+)\s*(?:=\s*([^;]+))?\s*;\s*$"); // Simple
 
                     if (fieldMatch.Success)
                     {
-                        string type = fieldMatch.Groups[2].Value;
-                        string name = fieldMatch.Groups[3].Value;
-                        var f = new Field(name, type) { Access = ParseAccess(fieldMatch.Groups[1].Value) };
+                        string type = fieldMatch.Groups[3].Value;
+                        string name = fieldMatch.Groups[4].Value;
+                        var f = new Field(name, type) { Access = ParseAccess(fieldMatch.Groups[1].Value), IsStatic = fieldMatch.Groups[2].Success };
+                        if (fieldMatch.Groups[5].Success && !string.IsNullOrEmpty(fieldMatch.Groups[5].Value))
+                            f.Initializer = fieldMatch.Groups[5].Value.Trim();
                         foreach (var attr in memberAttrs) f.Attributes.Add(attr);
                         cls.Fields.Add(f);
                         ConsumeLine();
@@ -356,18 +438,20 @@ namespace taste.Parse.Db
                     //           }
 
                     // 3a. Expression-bodied property: public string Name => expr;
-                    var exprBodyMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*=>\s*(.+);");
+                    var exprBodyMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*=>\s*(.+);");
                     if (exprBodyMatch.Success)
                     {
-                        var p = new Property(exprBodyMatch.Groups[6].Value, exprBodyMatch.Groups[5].Value)
+                        var p = new Property(exprBodyMatch.Groups[8].Value, exprBodyMatch.Groups[7].Value)
                         {
                             Access = ParseAccess(exprBodyMatch.Groups[1].Value),
                             HasGetter = true,
                             IsStatic = exprBodyMatch.Groups[2].Success,
-                            IsOverride = exprBodyMatch.Groups[3].Success,
-                            IsVirtual = exprBodyMatch.Groups[4].Success,
+                            IsSealed = exprBodyMatch.Groups[3].Success,
+                            IsOverride = exprBodyMatch.Groups[4].Success,
+                            IsVirtual = exprBodyMatch.Groups[5].Success,
+                            IsAbstract = exprBodyMatch.Groups[6].Success,
                             IsExpressionBodied = true,
-                            Initializer = exprBodyMatch.Groups[7].Value.Trim()
+                            Initializer = exprBodyMatch.Groups[9].Value.Trim()
                         };
                         foreach (var attr in memberAttrs) p.Attributes.Add(attr);
                         cls.Properties.Add(p);
@@ -375,19 +459,23 @@ namespace taste.Parse.Db
                         continue;
                     }
 
-                    // 3b. Single-line auto-property: public int Score { get; set; }
-                    var autoPropMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*\{\s*(get;\s*set;|set;\s*get;|get;)\s*\}");
+                    // 3b. Single-line auto-property: public int Score { get; set; } = 0;
+                    var autoPropMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*\{\s*(get;\s*set;|set;\s*get;|get;)\s*\}(?:\s*=\s*([^;]+))?\s*;");
                     if (autoPropMatch.Success)
                     {
-                        var p = new Property(autoPropMatch.Groups[6].Value, autoPropMatch.Groups[5].Value)
+                        var p = new Property(autoPropMatch.Groups[8].Value, autoPropMatch.Groups[7].Value)
                         {
                             Access = ParseAccess(autoPropMatch.Groups[1].Value),
-                            HasGetter = autoPropMatch.Groups[7].Value.Contains("get;"),
-                            HasSetter = autoPropMatch.Groups[7].Value.Contains("set;"),
+                            HasGetter = autoPropMatch.Groups[9].Value.Contains("get;"),
+                            HasSetter = autoPropMatch.Groups[9].Value.Contains("set;"),
                             IsStatic = autoPropMatch.Groups[2].Success,
-                            IsOverride = autoPropMatch.Groups[3].Success,
-                            IsVirtual = autoPropMatch.Groups[4].Success
+                            IsSealed = autoPropMatch.Groups[3].Success,
+                            IsOverride = autoPropMatch.Groups[4].Success,
+                            IsVirtual = autoPropMatch.Groups[5].Success,
+                            IsAbstract = autoPropMatch.Groups[6].Success
                         };
+                        if (autoPropMatch.Groups[10].Success && !string.IsNullOrEmpty(autoPropMatch.Groups[10].Value))
+                            p.Initializer = autoPropMatch.Groups[10].Value.Trim();
                         foreach (var attr in memberAttrs) p.Attributes.Add(attr);
                         cls.Properties.Add(p);
                         ConsumeLine();
@@ -395,15 +483,17 @@ namespace taste.Parse.Db
                     }
 
                     // 3c. Multi-line property: starts with "Type Name {" and spans multiple lines
-                    var multiLinePropMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*\{");
+                    var multiLinePropMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(\w+)(?:<[^>]*>)?\s+(\w+)\s*\{");
                     if (multiLinePropMatch.Success && !memberLine.Contains("(")) // not a method
                     {
-                        var p = new Property(multiLinePropMatch.Groups[6].Value, multiLinePropMatch.Groups[5].Value)
+                        var p = new Property(multiLinePropMatch.Groups[8].Value, multiLinePropMatch.Groups[7].Value)
                         {
                             Access = ParseAccess(multiLinePropMatch.Groups[1].Value),
                             IsStatic = multiLinePropMatch.Groups[2].Success,
-                            IsOverride = multiLinePropMatch.Groups[3].Success,
-                            IsVirtual = multiLinePropMatch.Groups[4].Success
+                            IsSealed = multiLinePropMatch.Groups[3].Success,
+                            IsOverride = multiLinePropMatch.Groups[4].Success,
+                            IsVirtual = multiLinePropMatch.Groups[5].Success,
+                            IsAbstract = multiLinePropMatch.Groups[6].Success
                         };
 
                         // Check if the property closes on the same line (single-line with body)
@@ -428,12 +518,8 @@ namespace taste.Parse.Db
                                 if (propLine.Contains("get")) p.HasGetter = true;
                                 if (propLine.Contains("set")) p.HasSetter = true;
 
-                                // Count braces
-                                foreach (char c in propLine)
-                                {
-                                    if (c == '{') depth++;
-                                    if (c == '}') depth--;
-                                }
+                                // Count braces (string-literal aware)
+                                depth += CountBraces(PeekLine());
                                 ConsumeLine();
                             }
                         }
@@ -446,19 +532,21 @@ namespace taste.Parse.Db
                     }
 
                     // 3d. Indexer: public char this[int index] { get; set; } or multi-line
-                    var indexerMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+(?:<[^>]+>)?)\s+this\s*\[([^\]]+)\]\s*(\{)?");
+                    var indexerMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(\w+(?:<[^>]+>)?)\s+this\s*\[([^\]]+)\]\s*(\{)?");
                     if (indexerMatch.Success)
                     {
-                        var p = new Property("Item", indexerMatch.Groups[5].Value)
+                        var p = new Property("Item", indexerMatch.Groups[7].Value)
                         {
                             Access = ParseAccess(indexerMatch.Groups[1].Value),
                             IsStatic = indexerMatch.Groups[2].Success,
-                            IsOverride = indexerMatch.Groups[3].Success,
-                            IsVirtual = indexerMatch.Groups[4].Success,
+                            IsSealed = indexerMatch.Groups[3].Success,
+                            IsOverride = indexerMatch.Groups[4].Success,
+                            IsVirtual = indexerMatch.Groups[5].Success,
+                            IsAbstract = indexerMatch.Groups[6].Success,
                             IsIndexer = true
                         };
                         // Parse indexer parameters
-                        string indexerParams = indexerMatch.Groups[6].Value;
+                        string indexerParams = indexerMatch.Groups[8].Value;
                         foreach (var param in indexerParams.Split(','))
                         {
                             var parts = param.Trim().Split(' ');
@@ -466,7 +554,7 @@ namespace taste.Parse.Db
                                 p.IndexerParameters.Add(new Parameter(parts.Last(), string.Join(" ", parts.Take(parts.Length - 1))));
                         }
 
-                        if (indexerMatch.Groups[7].Value == "{")
+                        if (indexerMatch.Groups[9].Value == "{")
                         {
                             // Multi-line indexer body
                             ConsumeLine();
@@ -480,11 +568,7 @@ namespace taste.Parse.Db
                                 if (propLine.Contains("get")) p.HasGetter = true;
                                 if (propLine.Contains("set")) p.HasSetter = true;
 
-                                foreach (char c in propLine)
-                                {
-                                    if (c == '{') depth++;
-                                    if (c == '}') depth--;
-                                }
+                                depth += CountBraces(PeekLine());
                                 ConsumeLine();
                             }
                         }
@@ -498,8 +582,8 @@ namespace taste.Parse.Db
                         continue;
                     }
 
-                    // 4. Constructors: public ClassName() { ... } or public ClassName(int value) { ... }
-                    var ctorMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(\w+)\s*\(([^)]*)\)\s*(\{)?");
+                    // 4. Constructors: public ClassName() { ... } or public ClassName(int value) : base(val) { ... }
+                    var ctorMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(\w+)\s*\(([^)]*)\)\s*(?::\s*(base|this)\s*\(([^)]*)\))?\s*(\{)?");
                     if (ctorMatch.Success && ctorMatch.Groups[3].Value == cls.Name)
                     {
                         var m = new Method(ctorMatch.Groups[3].Value, "")
@@ -515,8 +599,16 @@ namespace taste.Parse.Db
                         string paramsRaw = ctorMatch.Groups[4].Value;
                         ParseParameters(m.Parameters, paramsRaw);
 
+                        // Constructor initializer: : base(...) or : this(...)
+                        if (ctorMatch.Groups[5].Success)
+                        {
+                            string initKind = ctorMatch.Groups[5].Value; // "base" or "this"
+                            string initArgs = ctorMatch.Groups[6].Value;
+                            m.CtorInitializers.Add(new CtorInitializer(initKind, initArgs));
+                        }
+
                         ConsumeLine(); // consume the constructor declaration line
-                        if (ctorMatch.Groups[5].Value != "{")
+                        if (ctorMatch.Groups[7].Value != "{")
                         {
                             // { is on a separate line — consume lines until we find it
                             while (!IsEndOfFile())
@@ -526,19 +618,8 @@ namespace taste.Parse.Db
                                 ConsumeLine();
                             }
                         }
-                        // Skip the constructor body — we only need the signature
-                        {
-                            int bodyBraceDepth = 1;
-                            while (!IsEndOfFile() && bodyBraceDepth > 0)
-                            {
-                                string bodyLine = ConsumeLine();
-                                foreach (char c in bodyLine)
-                                {
-                                    if (c == '{') bodyBraceDepth++;
-                                    if (c == '}') bodyBraceDepth--;
-                                }
-                            }
-                        }
+                        // Parse the constructor body using ParseMethodBody
+                        ParseMethodBody(m.Body);
                         cls.Methods.Add(m);
                         continue;
                     }
@@ -569,18 +650,8 @@ namespace taste.Parse.Db
                                 ConsumeLine();
                             }
                         }
-                        {
-                            int bodyBraceDepth = 1;
-                            while (!IsEndOfFile() && bodyBraceDepth > 0)
-                            {
-                                string bodyLine = ConsumeLine();
-                                foreach (char c in bodyLine)
-                                {
-                                    if (c == '{') bodyBraceDepth++;
-                                    if (c == '}') bodyBraceDepth--;
-                                }
-                            }
-                        }
+                        // Parse the operator body using ParseMethodBody
+                        ParseMethodBody(oper.Body);
                         cls.Operators.Add(oper);
                         continue;
                     }
@@ -614,19 +685,40 @@ namespace taste.Parse.Db
                                 ConsumeLine();
                             }
                         }
+                        // Parse the instance operator body using ParseMethodBody
+                        ParseMethodBody(m.Body);
+                        cls.Methods.Add(m);
+                        continue;
+                    }
+
+                    // 5c. Conversion operators: public static implicit operator int(MyType v) { ... }
+                    //     public static explicit operator string(MyType v) { ... }
+                    var convOpMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*static\s+(implicit|explicit)\s+operator\s+(\w+(?:<[^>]+>)?)\s*\(([^)]*)\)\s*(\{)?");
+                    if (convOpMatch.Success)
+                    {
+                        string convType = convOpMatch.Groups[2].Value; // "implicit" or "explicit"
+                        string returnType = convOpMatch.Groups[3].Value;
+                        var oper = new OperatorOverload(convType + " operator", returnType)
                         {
-                            int bodyBraceDepth = 1;
-                            while (!IsEndOfFile() && bodyBraceDepth > 0)
+                            Access = ParseAccess(convOpMatch.Groups[1].Value)
+                        };
+                        foreach (var attr in memberAttrs) oper.Attributes.Add(attr);
+
+                        string paramsRaw = convOpMatch.Groups[4].Value;
+                        ParseParameters(oper.Parameters, paramsRaw);
+
+                        ConsumeLine(); // consume the conversion operator declaration line
+                        if (convOpMatch.Groups[5].Value != "{")
+                        {
+                            while (!IsEndOfFile())
                             {
-                                string bodyLine = ConsumeLine();
-                                foreach (char c in bodyLine)
-                                {
-                                    if (c == '{') bodyBraceDepth++;
-                                    if (c == '}') bodyBraceDepth--;
-                                }
+                                string nextLine = PeekLine()?.Trim();
+                                if (nextLine == "{" || nextLine?.EndsWith("{") == true) break;
+                                ConsumeLine();
                             }
                         }
-                        cls.Methods.Add(m);
+                        ParseMethodBody(oper.Body);
+                        cls.Operators.Add(oper);
                         continue;
                     }
 
@@ -693,7 +785,7 @@ namespace taste.Parse.Db
                                         ConsumeLine();
                                     }
                                 }
-                                ParseMethodBody(m);
+                                ParseMethodBody(m.Body);
                                 cls.Methods.Add(m);
                                 continue;
                             }
@@ -701,11 +793,11 @@ namespace taste.Parse.Db
                     }
 
                     // 6b. Strategy: match everything, then extract method name as last word before (
-                    var methodMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(new\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(async\s+)?(.+)\s+(\w+)\s*\(([^)]*)\)\s*(\{)?");
+                    var methodMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(new\s+)?(sealed\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(partial\s+)?(async\s+)?(extern\s+)?(.+)\s+((?:\w+\.)*\w+)\s*\(([^)]*)\)\s*(\{)?");
                     if (methodMatch.Success)
                     {
-                        string rawReturnType = methodMatch.Groups[8].Value.Trim();
-                        string methodName = methodMatch.Groups[9].Value;
+                        string rawReturnType = methodMatch.Groups[11].Value.Trim();
+                        string methodName = methodMatch.Groups[12].Value;
                         
                         var m = new Method(methodName, rawReturnType)
                         {
@@ -715,8 +807,12 @@ namespace taste.Parse.Db
                         if (methodMatch.Groups[3].Success) m.Modifiers |= MethodModifier.New;
                         if (methodMatch.Groups[4].Success) m.Modifiers |= MethodModifier.Sealed;
                         if (methodMatch.Groups[5].Success) m.Modifiers |= MethodModifier.Override;
-                        if (methodMatch.Groups[5].Success) m.Modifiers |= MethodModifier.Virtual;
-                        if (methodMatch.Groups[6].Success) m.Modifiers |= MethodModifier.Async;
+                        if (methodMatch.Groups[6].Success) m.Modifiers |= MethodModifier.Virtual;
+                        if (methodMatch.Groups[7].Success) m.Modifiers |= MethodModifier.Abstract;
+                        if (methodMatch.Groups[8].Success) m.Modifiers |= MethodModifier.Partial;
+                        if (methodMatch.Groups[9].Success) m.Modifiers |= MethodModifier.Async;
+                        bool isExtern = methodMatch.Groups[10].Success;
+                        if (isExtern) m.Modifiers |= MethodModifier.Extern;
 
                         // Apply collected attributes (from lines before the method)
                         foreach (var attr in memberAttrs) m.Attributes.Add(attr);
@@ -739,11 +835,21 @@ namespace taste.Parse.Db
                         }
 
                         // Params
-                        string paramsRaw = methodMatch.Groups[10].Value;
+                        string paramsRaw = methodMatch.Groups[13].Value;
                         ParseParameters(m.Parameters, paramsRaw);
 
+                        // Abstract/partial/extern methods end with ; not {
+                        bool isAbstractOrPartial = (memberLine.TrimEnd().EndsWith(";") && !memberLine.TrimEnd().EndsWith("{}")) || isExtern;
+                        if (isAbstractOrPartial)
+                        {
+                            ConsumeLine(); // consume the abstract/partial method declaration line
+                            // No body to parse — abstract methods have no implementation
+                            cls.Methods.Add(m);
+                            continue;
+                        }
+
                         ConsumeLine(); // consume the method declaration line
-                        if (methodMatch.Groups[11].Value != "{")
+                        if (methodMatch.Groups[14].Value != "{")
                         {
                             // { is on a separate line — consume lines until we find it
                             while (!IsEndOfFile())
@@ -754,7 +860,7 @@ namespace taste.Parse.Db
                             }
                         }
                         // Parse the method body using ParseStatement
-                        ParseMethodBody(m);
+                        ParseMethodBody(m.Body);
                         cls.Methods.Add(m);
                         continue;
                     }
@@ -781,14 +887,8 @@ namespace taste.Parse.Db
                                 ConsumeLine();
                             }
                         }
-                        {
-                            int bodyBraceDepth = 1;
-                            while (!IsEndOfFile() && bodyBraceDepth > 0)
-                            {
-                                string bodyLine = ConsumeLine();
-                                foreach (char c in bodyLine) { if (c == '{') bodyBraceDepth++; if (c == '}') bodyBraceDepth--; }
-                            }
-                        }
+                        // Parse the finalizer body using ParseMethodBody
+                        ParseMethodBody(m.Body);
                         cls.Finalizer = m;
                         continue;
                     }
@@ -855,14 +955,8 @@ namespace taste.Parse.Db
                                         ConsumeLine();
                                     }
                                 }
-                                {
-                                    int bodyDepth = 1;
-                                    while (!IsEndOfFile() && bodyDepth > 0)
-                                    {
-                                        string bodyLine = ConsumeLine();
-                                        foreach (char c in bodyLine) { if (c == '{') bodyDepth++; if (c == '}') bodyDepth--; }
-                                    }
-                                }
+                                // Parse the companion method body using ParseMethodBody
+                                ParseMethodBody(m.Body);
 
                                 companion.Methods.Add(m);
                                 continue;
@@ -874,7 +968,53 @@ namespace taste.Parse.Db
                         continue;
                     }
 
+                    // 9. Event: public event EventHandler OnClick;
+                    var eventMatch = Regex.Match(memberLine, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(virtual\s+)?(override\s+)?event\s+(\w+)\s+(\w+)\s*;");
+                    if (eventMatch.Success)
+                    {
+                        var evt = new Event(eventMatch.Groups[6].Value, eventMatch.Groups[5].Value)
+                        {
+                            Access = ParseAccess(eventMatch.Groups[1].Value),
+                            IsStatic = eventMatch.Groups[2].Success,
+                            IsVirtual = eventMatch.Groups[3].Success,
+                            IsOverride = eventMatch.Groups[4].Success
+                        };
+                        foreach (var attr in memberAttrs) evt.Attributes.Add(attr);
+                        cls.Events.Add(evt);
+                        ConsumeLine();
+                        continue;
+                    }
+
+                    // 10. Nested class/struct
+                    if (IsClassOrStructLine(memberLine))
+                    {
+                        var nested = ParseClass();
+                        if (nested != null) cls.NestedClasses.Add(nested);
+                        continue;
+                    }
+
+                    // 11. Nested enum
+                    if (StartsWithAccessAndKeyword(memberLine, DbKeywords.Enum))
+                    {
+                        cls.NestedEnums.Add(ParseEnum());
+                        continue;
+                    }
+
+                    // 12. Nested delegate
+                    if (StartsWithAccessAndKeyword(memberLine, DbKeywords.Delegate))
+                    {
+                        cls.NestedDelegates.Add(ParseDelegate());
+                        continue;
+                    }
+
                     ConsumeLine();
+                    }
+                    catch (Exception ex)
+                    {
+                        // Error recovery: skip the current line and continue parsing
+                        System.Diagnostics.Debug.WriteLine($"[DbParser] Skipping member due to parse error: {ex.Message}");
+                        ConsumeLine();
+                    }
                 }
             return cls;
         }
@@ -923,10 +1063,12 @@ namespace taste.Parse.Db
                     ConsumeLine();
             }
 
-            var match = Regex.Match(stripped, @"enum\s+([a-zA-Z0-9_]+)");
+            var match = Regex.Match(stripped, @"enum\s+([a-zA-Z0-9_]+)(?:\s*:\s*(\w+))?");
             if (!match.Success) throw new Exception($"Invalid enum declaration: {line}");
 
             var en = new EnumDecl(match.Groups[1].Value) { Access = access };
+            if (match.Groups[2].Success && !string.IsNullOrEmpty(match.Groups[2].Value))
+                en.UnderlyingType = match.Groups[2].Value;
 
             while (!IsEndOfFile())
             {
@@ -935,8 +1077,19 @@ namespace taste.Parse.Db
                 if (string.IsNullOrWhiteSpace(member)) { ConsumeLine(); continue; }
                 if (member.StartsWith("///")) { ConsumeLine(); continue; }
                 if (member.StartsWith("[")) { ConsumeLine(); continue; } // skip attributes
-                string cleanMember = member.TrimEnd(',');
-                en.Members.Add(cleanMember);
+                string cleanMember = member.TrimEnd(',').Trim();
+                // Handle explicit enum values: Name = Value
+                if (cleanMember.Contains("="))
+                {
+                    int eqIdx = cleanMember.IndexOf('=');
+                    string name = cleanMember.Substring(0, eqIdx).Trim();
+                    string value = cleanMember.Substring(eqIdx + 1).Trim();
+                    en.Members.Add($"{name} = {value}");
+                }
+                else
+                {
+                    en.Members.Add(cleanMember);
+                }
                 ConsumeLine();
             }
             return en;
@@ -945,21 +1098,109 @@ namespace taste.Parse.Db
         private DelegateDecl ParseDelegate()
         {
             string line = ConsumeLine().Trim();
-            var match = Regex.Match(line, @"delegate\s+([a-zA-Z0-9_ ]+)\s+([a-zA-Z0-9_]+)\s*\((.*)\);");
+            // Support: delegate ReturnType Name(params); with generic return types
+            var match = Regex.Match(line, @"delegate\s+((?:\w+\.)*\w+(?:<[^>]+>)?(?:\[\])?)\s+([a-zA-Z0-9_]+)\s*\(([^)]*)\)\s*;");
             if (!match.Success) throw new Exception($"Invalid delegate declaration: {line}");
 
             var del = new DelegateDecl(match.Groups[2].Value, match.Groups[1].Value.Trim());
-            // Simple param split
             string paramsRaw = match.Groups[3].Value;
             if (!string.IsNullOrWhiteSpace(paramsRaw))
             {
-                foreach (var p in paramsRaw.Split(','))
-                {
-                    var parts = p.Trim().Split(' ');
-                    if (parts.Length == 2) del.Parameters.Add(new Parameter(parts[1], parts[0]));
-                }
+                ParseParameters(del.Parameters, paramsRaw);
             }
             return del;
+        }
+
+        /// <summary>
+        /// Parses a mixin declaration: <c>with TypeName { ... }</c> or <c>public with TypeName { ... }</c>.
+        /// Mixins add methods to an existing type without inheritance.
+        /// </summary>
+        private MixinDeclaration ParseMixin()
+        {
+            string line = ConsumeLine().Trim();
+            var match = Regex.Match(line, @"^\s*(public|private|protected|internal)?\s*with\s+(\w+(?:\.\w+)*)\s*\{?");
+            if (!match.Success) throw new Exception($"Invalid mixin declaration: {line}");
+
+            var mixin = new MixinDeclaration(match.Groups[2].Value)
+            {
+                Access = ParseAccess(match.Groups[1].Value)
+            };
+
+            // If opening brace wasn't on the same line, consume until we find it
+            if (!line.Contains("{"))
+            {
+                while (!IsEndOfFile())
+                {
+                    string nextLine = PeekLine()?.Trim();
+                    if (nextLine == "{" || nextLine?.EndsWith("{") == true) break;
+                    ConsumeLine();
+                }
+            }
+
+            // Parse mixin body
+            while (!IsEndOfFile())
+            {
+                string inner = PeekLine()?.Trim();
+                if (string.IsNullOrWhiteSpace(inner) || inner.StartsWith("//")) { ConsumeLine(); continue; }
+                if (inner == "}") { ConsumeLine(); break; }
+
+                var memberAttrs = CollectAttributes();
+                inner = PeekLine()?.Trim();
+                if (inner == null) break;
+
+                // Methods inside mixin
+                var methodMatch = Regex.Match(inner, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*\(([^)]*)\)\s*(\{)?");
+                if (methodMatch.Success)
+                {
+                    var m = new Method(methodMatch.Groups[6].Value, methodMatch.Groups[5].Value)
+                    {
+                        Access = ParseAccess(methodMatch.Groups[1].Value)
+                    };
+                    if (methodMatch.Groups[2].Success) m.Modifiers |= MethodModifier.Static;
+                    if (methodMatch.Groups[3].Success) m.Modifiers |= MethodModifier.Override;
+                    if (methodMatch.Groups[4].Success) m.Modifiers |= MethodModifier.Virtual;
+                    foreach (var attr in memberAttrs) m.Attributes.Add(attr);
+
+                    string paramsRaw = methodMatch.Groups[7].Value;
+                    ParseParameters(m.Parameters, paramsRaw);
+
+                    ConsumeLine();
+                    if (methodMatch.Groups[8].Value != "{")
+                    {
+                        while (!IsEndOfFile())
+                        {
+                            string nextLine = PeekLine()?.Trim();
+                            if (nextLine == "{" || nextLine?.EndsWith("{") == true) break;
+                            ConsumeLine();
+                        }
+                    }
+                    ParseMethodBody(m.Body);
+                    mixin.Methods.Add(m);
+                    continue;
+                }
+
+                // Properties inside mixin
+                var propMatch = Regex.Match(inner, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(\w+(?:<[^>]+>)?)\s+(\w+)\s*\{\s*(get;\s*set;|set;\s*get;|get;)\s*\}");
+                if (propMatch.Success)
+                {
+                    var p = new Property(propMatch.Groups[6].Value, propMatch.Groups[5].Value)
+                    {
+                        Access = ParseAccess(propMatch.Groups[1].Value),
+                        HasGetter = propMatch.Groups[7].Value.Contains("get;"),
+                        HasSetter = propMatch.Groups[7].Value.Contains("set;"),
+                        IsStatic = propMatch.Groups[2].Success,
+                        IsOverride = propMatch.Groups[3].Success,
+                        IsVirtual = propMatch.Groups[4].Success
+                    };
+                    foreach (var attr in memberAttrs) p.Attributes.Add(attr);
+                    mixin.Properties.Add(p);
+                    ConsumeLine();
+                    continue;
+                }
+
+                ConsumeLine(); // skip unknown
+            }
+            return mixin;
         }
 
         // ── New top-level declaration parsers ──────────────────────────────────
@@ -1000,8 +1241,8 @@ namespace taste.Parse.Db
                 inner = PeekLine()?.Trim();
                 if (inner == null) break;
 
-                // Method declaration
-                var methodMatch = Regex.Match(inner, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?(\w+)\s+(\w+)\s*\(([^)]*)\)\s*;");
+                // Method declaration — allow with or without trailing semicolon, and support generic return types
+                var methodMatch = Regex.Match(inner, @"^\s*(public|private|protected|internal)?\s*(static\s+)?(override\s+)?(virtual\s+)?(abstract\s+)?((?:\w+\.)*\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*\(([^)]*)\)\s*;?\s*$");
                 if (methodMatch.Success)
                 {
                     var m = new Method(methodMatch.Groups[7].Value, methodMatch.Groups[6].Value)
@@ -1016,11 +1257,7 @@ namespace taste.Parse.Db
 
                     string paramsRaw = methodMatch.Groups[8].Value;
                     if (!string.IsNullOrWhiteSpace(paramsRaw))
-                        foreach (var p in paramsRaw.Split(','))
-                        {
-                            var parts = p.Trim().Split(' ');
-                            if (parts.Length == 2) m.Parameters.Add(new Parameter(parts[1], parts[0]));
-                        }
+                        ParseParameters(m.Parameters, paramsRaw);
                     iface.Methods.Add(m);
                     ConsumeLine();
                     continue;
@@ -1073,14 +1310,14 @@ namespace taste.Parse.Db
                 if (string.IsNullOrWhiteSpace(inner) || inner.StartsWith("//")) { ConsumeLine(); continue; }
                 if (inner == "}") { ConsumeLine(); break; }
 
-                // Variant: Name or Name(Type1, Type2) or Name(Type1 name1, Type2 name2)
-                var variantMatch = Regex.Match(inner, @"^\s*(\w+)(?:\s*\(([^)]*)\))?\s*,?\s*$");
+                // Variant: Name or Name(Type1, Type2) or Name(Type1 name1, Type2 name2) — supports generic types like Dictionary<string, int>
+                var variantMatch = Regex.Match(inner, @"^\s*(\w+)(?:\s*\((.+)\))?\s*,?\s*$");
                 if (variantMatch.Success)
                 {
                     var variant = new SumVariant(variantMatch.Groups[1].Value);
                     if (variantMatch.Groups[2].Success && !string.IsNullOrWhiteSpace(variantMatch.Groups[2].Value))
                     {
-                        foreach (var param in variantMatch.Groups[2].Value.Split(','))
+                        foreach (var param in SplitTopLevelCommas(variantMatch.Groups[2].Value))
                         {
                             var parts = param.Trim().Split(' ');
                             if (parts.Length >= 2)
@@ -1141,8 +1378,10 @@ namespace taste.Parse.Db
 
         private static bool IsClassOrStructLine(string line)
         {
-            // Match lines like "class Foo", "struct Foo", "stub Foo", "public class Foo", etc.
-            return Regex.IsMatch(line, @"^\s*(public|private|protected|internal)?\s*(partial\s+)?(class|struct|stub)\s+");
+            // Match lines like "class Foo", "struct Foo", "stub Foo", "public class Foo",
+            // "abstract class Foo", "sealed class Foo", "readonly struct Foo", "partial class Foo",
+            // "abstract sealed class Foo", etc.
+            return Regex.IsMatch(line, @"^\s*(public|private|protected|internal)?\s*(?:(?:abstract|sealed|static|partial|readonly)\s+)*(class|struct|stub)\s+");
         }
 
         /// <summary>
@@ -1175,14 +1414,23 @@ namespace taste.Parse.Db
         private void ParseParameters(List<Parameter> parametersList, string paramsRaw)
         {
             if (string.IsNullOrWhiteSpace(paramsRaw)) return;
-            foreach (var p in paramsRaw.Split(','))
+
+            // Split on commas that are at depth 0 (outside of < > ( ) [ ])
+            var paramParts = SplitTopLevelCommas(paramsRaw);
+
+            foreach (var p in paramParts)
             {
-                var parts = p.Trim().Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                string trimmed = p.Trim();
+                if (string.IsNullOrWhiteSpace(trimmed)) continue;
+
+                var parts = trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length == 0) continue;
-                
+
                 string modifier = "";
                 bool isParams = false;
+                bool isOptional = false;
                 int startIndex = 0;
+
                 if (parts[0] == "ref" || parts[0] == "out" || parts[0] == "in" || parts[0] == "this")
                 {
                     modifier = parts[0];
@@ -1193,12 +1441,35 @@ namespace taste.Parse.Db
                     isParams = true;
                     startIndex = 1;
                 }
-                
+
+                // Check for default value: Type name = expr
+                string defaultValue = null;
+                int eqIdx = trimmed.IndexOf('=');
+                if (eqIdx > 0)
+                {
+                    // Make sure it's not ==, !=, <=, >=, =>
+                    char afterEq = eqIdx + 1 < trimmed.Length ? trimmed[eqIdx + 1] : '\0';
+                    char beforeEq = eqIdx > 0 ? trimmed[eqIdx - 1] : '\0';
+                    if (afterEq != '=' && beforeEq != '!' && beforeEq != '<' && beforeEq != '>' && afterEq != '>')
+                    {
+                        defaultValue = trimmed.Substring(eqIdx + 1).Trim().TrimEnd();
+                        trimmed = trimmed.Substring(0, eqIdx).Trim();
+                        isOptional = true;
+                        // Re-split without the default value
+                        parts = trimmed.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    }
+                }
+
                 if (parts.Length - startIndex >= 2)
                 {
-                    var param = new Parameter(parts.Last(), string.Join(" ", parts.Skip(startIndex).Take(parts.Length - startIndex - 1)));
+                    // Type can include generics: Dictionary<string, int> name
+                    // Everything before the last word is the type
+                    string name = parts[parts.Length - 1];
+                    string type = string.Join(" ", parts.Skip(startIndex).Take(parts.Length - startIndex - 1));
+                    var param = new Parameter(name, type);
                     param.Modifier = modifier;
                     param.IsParams = isParams;
+                    if (isOptional) param.Default = defaultValue;
                     parametersList.Add(param);
                 }
                 else if (parts.Length - startIndex == 1)
@@ -1206,6 +1477,7 @@ namespace taste.Parse.Db
                     var param = new Parameter("", parts[startIndex]);
                     param.Modifier = modifier;
                     param.IsParams = isParams;
+                    if (isOptional) param.Default = defaultValue;
                     parametersList.Add(param);
                 }
             }
@@ -1277,11 +1549,23 @@ namespace taste.Parse.Db
             while (!IsEndOfFile())
             {
                 string peek = PeekLine()?.Trim();
-                if (string.IsNullOrWhiteSpace(peek)) { ConsumeLine(); continue; }
+                // Don't consume blank lines — let the caller decide what to do with them
+                if (string.IsNullOrWhiteSpace(peek)) break;
                 if (!peek.StartsWith("[")) break;
 
                 // It's an attribute line — consume it
                 string attrLine = ConsumeLine().Trim();
+
+                // Handle multi-line attributes: if the line starts with [ but doesn't end with ], keep consuming
+                if (attrLine.StartsWith("[") && !attrLine.EndsWith("]"))
+                {
+                    while (!IsEndOfFile())
+                    {
+                        string nextLine = ConsumeLine().Trim();
+                        attrLine += " " + nextLine;
+                        if (nextLine.EndsWith("]")) break;
+                    }
+                }
 
                 // Parse [Represents("...")]
                 var representsMatch = Regex.Match(attrLine, @"\[Represents\(""([^""]+)""\)\]");
@@ -1387,7 +1671,7 @@ namespace taste.Parse.Db
         /// Parses a method body: reads lines until the closing brace,
         /// parsing each statement into the method's Body list.
         /// </summary>
-        private void ParseMethodBody(Method method)
+        private void ParseMethodBody(List<Statement> body)
         {
             int depth = 1;
             while (!IsEndOfFile() && depth > 0)
@@ -1409,20 +1693,8 @@ namespace taste.Parse.Db
                     continue;
                 }
 
-                // Check for nested blocks that increase depth
-                if (innerLine.EndsWith("{") && !StartsWithKeyword(innerLine, DbKeywords.If) && !StartsWithKeyword(innerLine, DbKeywords.While) &&
-                    !StartsWithKeyword(innerLine, DbKeywords.For) && !StartsWithKeyword(innerLine, DbKeywords.Foreach) && !StartsWithKeyword(innerLine, DbKeywords.Try) &&
-                    !StartsWithKeyword(innerLine, DbKeywords.Else) && !StartsWithKeyword(innerLine, DbKeywords.Do) &&
-                    !StartsWithKeyword(innerLine, DbKeywords.Switch))
-                {
-                    // Unknown block — skip it
-                    ConsumeLine();
-                    depth++;
-                    continue;
-                }
-
-                // Parse the statement
-                ParseStatement(method.Body);
+                // Parse the statement (ParseStatement handles all block types)
+                ParseStatement(body);
             }
         }
 
@@ -1468,6 +1740,155 @@ namespace taste.Parse.Db
                 return;
             }
 
+            // ── Using statement: using (var x = expr) { ... } ──────────────
+            if (StartsWithKeyword(line, DbKeywords.Using))
+            {
+                string usingContent = ExtractParenContent(line);
+                if (!string.IsNullOrEmpty(usingContent))
+                {
+                    string resourceDecl = usingContent.Trim();
+                    Variable resourceVar;
+                    // Try: var x = expr  or  Type x = expr  or  Type x
+                    var varMatch = Regex.Match(resourceDecl, @"^(var|\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*=\s*(.+)$");
+                    if (varMatch.Success)
+                    {
+                        resourceVar = new Variable(varMatch.Groups[2].Value, varMatch.Groups[1].Value)
+                        {
+                            Initializer = varMatch.Groups[3].Value.Trim()
+                        };
+                        if (varMatch.Groups[1].Value == "var") resourceVar.IsInferred = true;
+                    }
+                    else
+                    {
+                        // Bare expression: using (mutex) { ... }
+                        resourceVar = new Variable("", resourceDecl);
+                    }
+
+                    var usingBlock = new UsingBlock(resourceVar);
+                    if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
+                    {
+                        if (!line.EndsWith("{")) ConsumeLine();
+                        int depth = 1;
+                        while (!IsEndOfFile() && depth > 0)
+                        {
+                            string inner = PeekLine()?.Trim();
+                            if (inner == "}") { ConsumeLine(); depth--; }
+                            else if (inner != null)
+                            {
+                                ConsumeLine();
+                                ParseStatement(usingBlock.Body);
+                            }
+                            else ConsumeLine();
+                        }
+                    }
+                    body.Add(usingBlock);
+                    return;
+                }
+            }
+
+            // ── Lock statement: lock (expr) { ... } ────────────────────────
+            if (StartsWithKeyword(line, DbKeywords.Lock))
+            {
+                string lockContent = ExtractParenContent(line);
+                if (!string.IsNullOrEmpty(lockContent))
+                {
+                    string lockExpr = lockContent.Trim();
+                    var lockBlock = new LockBlock(lockExpr);
+                    if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
+                    {
+                        if (!line.EndsWith("{")) ConsumeLine();
+                        int depth = 1;
+                        while (!IsEndOfFile() && depth > 0)
+                        {
+                            string inner = PeekLine()?.Trim();
+                            if (inner == "}") { ConsumeLine(); depth--; }
+                            else if (inner != null)
+                            {
+                                ConsumeLine();
+                                ParseStatement(lockBlock.Body);
+                            }
+                            else ConsumeLine();
+                        }
+                    }
+                    body.Add(lockBlock);
+                    return;
+                }
+            }
+
+            // ── Checked / Unchecked: checked { ... } / unchecked { ... } ────
+            if (StartsWithKeyword(line, DbKeywords.Checked) || StartsWithKeyword(line, DbKeywords.Unchecked))
+            {
+                bool isChecked = StartsWithKeyword(line, DbKeywords.Checked);
+                var checkedBlock = new CheckedBlock(isChecked);
+                if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
+                {
+                    if (!line.EndsWith("{")) ConsumeLine();
+                    int depth = 1;
+                    while (!IsEndOfFile() && depth > 0)
+                    {
+                        string inner = PeekLine()?.Trim();
+                        if (inner == "}") { ConsumeLine(); depth--; }
+                        else if (inner != null)
+                        {
+                            ConsumeLine();
+                            ParseStatement(checkedBlock.Body);
+                        }
+                        else ConsumeLine();
+                    }
+                }
+                body.Add(checkedBlock);
+                return;
+            }
+
+            // ── Unsafe: unsafe { ... } ────────────────────────────────────────
+            if (StartsWithKeyword(line, DbKeywords.Unsafe))
+            {
+                var unsafeBlock = new UnsafeBlock();
+                if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
+                {
+                    if (!line.EndsWith("{")) ConsumeLine();
+                    int depth = 1;
+                    while (!IsEndOfFile() && depth > 0)
+                    {
+                        string inner = PeekLine()?.Trim();
+                        if (inner == "}") { ConsumeLine(); depth--; }
+                        else if (inner != null)
+                        {
+                            ConsumeLine();
+                            ParseStatement(unsafeBlock.Body);
+                        }
+                        else ConsumeLine();
+                    }
+                }
+                body.Add(unsafeBlock);
+                return;
+            }
+
+            // ── Fixed: fixed (Type* ptr = &expr) { ... } ──────────────────────
+            if (StartsWithKeyword(line, DbKeywords.Fixed))
+            {
+                string decl = ExtractParenContent(line);
+                var fixedStmt = new FixedStatement(decl);
+                if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
+                {
+                    if (!line.EndsWith("{")) ConsumeLine();
+                    int depth = 1;
+                    while (!IsEndOfFile() && depth > 0)
+                    {
+                        string inner = PeekLine()?.Trim();
+                        if (inner == "}") { ConsumeLine(); depth--; }
+                        else if (inner != null)
+                        {
+                            ConsumeLine();
+                            ParseStatement(fixedStmt.Body);
+                        }
+                        else ConsumeLine();
+                    }
+                }
+                body.Add(fixedStmt);
+                return;
+            }
+
             // ── Do-while ─────────────────────────────────────────────────────
             if (StartsWithKeyword(line, DbKeywords.Do))
             {
@@ -1493,8 +1914,9 @@ namespace taste.Parse.Db
                 if (whileLine != null && StartsWithKeyword(whileLine, DbKeywords.While))
                 {
                     ConsumeLine();
-                    var exprMatch = Regex.Match(whileLine, @"\(([^)]+)\)");
-                    if (exprMatch.Success) doWhile.Condition = exprMatch.Groups[1].Value;
+                    string conditionText = ExtractParenContent(whileLine);
+                    var parsedExpr = _exprParser.ParseExpression(conditionText);
+                    doWhile.Condition = parsedExpr?.ToString() ?? conditionText;
                 }
                 body.Add(doWhile);
                 return;
@@ -1504,8 +1926,8 @@ namespace taste.Parse.Db
             if (StartsWithKeyword(line, DbKeywords.Switch))
             {
                 var match = new MatchStatement();
-                var exprMatch = Regex.Match(line, @"switch\s*\(([^)]+)\)");
-                if (exprMatch.Success) match.Expression = exprMatch.Groups[1].Value;
+                string conditionText = ExtractParenContent(line);
+                if (!string.IsNullOrEmpty(conditionText)) match.Expression = conditionText;
 
                 if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
                 {
@@ -1519,6 +1941,7 @@ namespace taste.Parse.Db
 
                         // Match arm: pattern => { ... } or pattern if guard => { ... }
                         string armLine = ConsumeLine().Trim();
+                        // Extract guard using ExtractParenContent for nested parens
                         var armMatch = Regex.Match(armLine, @"^\s*(.+?)\s*(?:if\s*\(([^)]+)\))?\s*=>\s*(\{)?");
                         if (armMatch.Success)
                         {
@@ -1560,9 +1983,8 @@ namespace taste.Parse.Db
 
             if (StartsWithKeyword(line, DbKeywords.If))
             {
-                string expression = line;
-                var exprMatch = Regex.Match(line, @"\(([^)]+)\)");
-                if (exprMatch.Success) expression = exprMatch.Groups[1].Value;
+                string expression = ExtractParenContent(line);
+                if (string.IsNullOrEmpty(expression)) expression = line;
 
                 var cond = new Condition(ConditionKind.If, expression);
 
@@ -1582,13 +2004,89 @@ namespace taste.Parse.Db
                         else ConsumeLine();
                     }
                 }
+
+                // Handle else if / else chains
+                while (!IsEndOfFile())
+                {
+                    string nextLine = PeekLine()?.Trim();
+                    if (nextLine == null) break;
+
+                    if (StartsWithKeyword(nextLine, DbKeywords.Else))
+                    {
+                        ConsumeLine(); // consume the "else" or "else if" line
+                        string elseRest = nextLine.Substring(DbKeywords.Else.Length).Trim();
+
+                        if (StartsWithKeyword(elseRest, DbKeywords.If) || elseRest.StartsWith("if(") || elseRest.StartsWith("if ("))
+                        {
+                            // else if (condition) { ... }
+                            var elseIfExpr = Regex.Match(nextLine, @"\(([^)]+)\)");
+                            string elseIfCondition = elseIfExpr.Success ? elseIfExpr.Groups[1].Value : elseRest;
+                            var elseIfCond = new Condition(ConditionKind.ElseIf, elseIfCondition);
+
+                            if (nextLine.EndsWith("{") || PeekLine()?.Trim() == "{")
+                            {
+                                if (!nextLine.EndsWith("{")) ConsumeLine();
+                                int depth = 1;
+                                while (!IsEndOfFile() && depth > 0)
+                                {
+                                    string inner = PeekLine()?.Trim();
+                                    if (inner == "}") { ConsumeLine(); depth--; }
+                                    else if (inner != null)
+                                    {
+                                        ConsumeLine();
+                                        ParseStatement(elseIfCond.Body);
+                                    }
+                                    else ConsumeLine();
+                                }
+                            }
+                            cond.ElseBody.Add(elseIfCond);
+                            // Continue chaining: the elseIfCond becomes the new "cond" for further else chains
+                            // We need to track the tail for further else/else if
+                            // For simplicity, we add else-if as a nested Condition in ElseBody
+                            // and continue checking for more else/else if
+                            cond = elseIfCond; // chain from the latest else-if
+                        }
+                        else
+                        {
+                            // else { ... }
+                            var elseCond = new Condition(ConditionKind.Else);
+                            // Check if else is followed by { on the same line or next line
+                            string elseLine = nextLine;
+                            if (elseLine.Contains("{") || PeekLine()?.Trim() == "{")
+                            {
+                                if (!elseLine.Contains("{")) ConsumeLine();
+                                int depth = 1;
+                                while (!IsEndOfFile() && depth > 0)
+                                {
+                                    string inner = PeekLine()?.Trim();
+                                    if (inner == "}") { ConsumeLine(); depth--; }
+                                    else if (inner != null)
+                                    {
+                                        ConsumeLine();
+                                        ParseStatement(elseCond.Body);
+                                    }
+                                    else ConsumeLine();
+                                }
+                            }
+                            cond.ElseBody.Add(elseCond);
+                            break; // else terminates the chain
+                        }
+                    }
+                    else
+                    {
+                        break; // no else follows
+                    }
+                }
+
+                // Find the original if condition to add to body
+                // Walk back to find the root if
                 body.Add(cond);
             }
             else if (StartsWithKeyword(line, DbKeywords.Unless) || line.StartsWith("unless("))
             {
                 // unless (cond) { } → if (!(cond)) { }
-                var exprMatch = Regex.Match(line, @"unless\s*\(([^)]+)\)");
-                string expression = exprMatch.Success ? exprMatch.Groups[1].Value : line;
+                string expression = ExtractParenContent(line);
+                if (string.IsNullOrEmpty(expression)) expression = line;
 
                 var unlessCond = new Condition(ConditionKind.Unless, expression);
                 if (line.EndsWith("{") || PeekLine()?.Trim() == "{")
@@ -1612,8 +2110,8 @@ namespace taste.Parse.Db
                 Loop loop;
                 if (line.StartsWith(DbKeywords.Repeat + " " + DbKeywords.Until) || line.StartsWith(DbKeywords.Repeat + DbKeywords.Until + "("))
                 {
-                    var m = Regex.Match(line, @"repeat\s+until\s*\(([^)]+)\)");
-                    loop = new Loop(LoopKind.RepeatUntil, m.Success ? m.Groups[1].Value : "");
+                    string untilCondition = ExtractParenContent(line);
+                    loop = new Loop(LoopKind.RepeatUntil, untilCondition ?? "");
                 }
                 else
                 {
@@ -1708,18 +2206,39 @@ namespace taste.Parse.Db
                 LoopKind kind = StartsWithKeyword(line, DbKeywords.While) ? LoopKind.While :
                                 StartsWithKeyword(line, DbKeywords.For) ? LoopKind.For : LoopKind.ForEach;
 
-                string expression = line;
-                var exprMatch = Regex.Match(line, @"\(([^)]+)\)");
-                if (exprMatch.Success) expression = exprMatch.Groups[1].Value;
+                // Extract the full parenthesized content (handles nested parens like generics)
+                string expression = ExtractParenContent(line);
 
                 var loop = new Loop(kind, expression);
                 if (kind == LoopKind.ForEach)
                 {
-                    var m = Regex.Match(line, @"foreach\s*\(\s*(\w+)\s+(\w+)\s+in\s+(\w+)\s*\)");
+                    // Supports: foreach (Type name in collection)
+                    //           foreach (var name in collection)
+                    //           foreach (Dictionary<string, int> name in collection)
+                    //           foreach (NS.Type name in obj.Collection)
+                    var m = Regex.Match(line, @"foreach\s*\(\s*(var|\w+(?:<[^>]+>)?(?:\.\w+)*(?:\[\])*)\s+(\w+)\s+in\s+(.+?)\s*\)");
                     if (m.Success)
                     {
                         loop.IterationVariable = new Variable(m.Groups[2].Value, m.Groups[1].Value);
-                        loop.Collection = m.Groups[3].Value;
+                        loop.Collection = m.Groups[3].Value.Trim();
+                    }
+                }
+                else if (kind == LoopKind.For)
+                {
+                    // Decompose for(init; cond; incr) into separate parts
+                    // The expression contains the full paren content
+                    string forContent = expression;
+                    int semi1 = FindTopLevelSemicolon(forContent, 0);
+                    int semi2 = semi1 >= 0 ? FindTopLevelSemicolon(forContent, semi1 + 1) : -1;
+                    if (semi1 >= 0 && semi2 >= 0)
+                    {
+                        string initPart = forContent.Substring(0, semi1).Trim();
+                        string condPart = forContent.Substring(semi1 + 1, semi2 - semi1 - 1).Trim();
+                        string incrPart = forContent.Substring(semi2 + 1).Trim();
+                        loop.Expression = condPart; // condition only
+                        // Store init and increment as raw text in the loop for the emitter
+                        loop.ForInitializer = initPart;
+                        loop.ForIncrement = incrPart;
                     }
                 }
 
@@ -1764,18 +2283,19 @@ namespace taste.Parse.Db
                 while (!IsEndOfFile() && StartsWithKeyword(PeekLine()?.Trim(), DbKeywords.Catch))
                 {
                     string catchLine = ConsumeLine().Trim();
-                    var catchMatch = Regex.Match(catchLine, @"catch\s*\(([^)]+)\)");
+                    string catchContent = ExtractParenContent(catchLine);
                     var clause = new CatchClause();
-                    if (catchMatch.Success)
+                    if (!string.IsNullOrEmpty(catchContent))
                     {
-                        string content = catchMatch.Groups[1].Value;
-                        var parts = content.Split(' ');
-                        if (parts.Length >= 2)
+                        // Handle: ExceptionType variableName  or  ExceptionType  or  ExceptionType<Generic> variableName
+                        // Split on the last space to separate type from variable name
+                        int lastSpace = catchContent.LastIndexOf(' ');
+                        if (lastSpace > 0)
                         {
-                            clause.ExceptionType = parts[0];
-                            clause.VariableName = parts[1];
+                            clause.ExceptionType = catchContent.Substring(0, lastSpace).Trim();
+                            clause.VariableName = catchContent.Substring(lastSpace + 1).Trim();
                         }
-                        else clause.ExceptionType = content;
+                        else clause.ExceptionType = catchContent.Trim();
                     }
 
                     if (catchLine.EndsWith("{") || PeekLine()?.Trim() == "{")
@@ -1817,21 +2337,22 @@ namespace taste.Parse.Db
             }
             else if (StartsWithKeyword(line, DbKeywords.Yield))
             {
-                bool isBreak = line.Contains("break");
-                body.Add(new YieldStatement(isBreak) { Expression = isBreak ? null : line.Replace(DbKeywords.Yield + " return", "").Trim() });
+                bool isBreak = line.Trim().StartsWith(DbKeywords.Yield + " break") || line.Trim() == DbKeywords.Yield + " break;";
+                string yieldExpr = isBreak ? null : line.Substring(line.IndexOf(DbKeywords.Yield + " return") + DbKeywords.Yield.Length + 7).Trim().TrimEnd(';').Trim();
+                var parsedExpr = isBreak ? null : _exprParser.ParseExpression(yieldExpr);
+                body.Add(new YieldStatement(isBreak) { Expression = parsedExpr?.ToString() ?? yieldExpr });
             }
             else if (StartsWithKeyword(line, DbKeywords.Throw))
             {
-                string expr = line.Replace(DbKeywords.Throw + " ", "").Trim().TrimEnd(';');
+                string expr = line.TrimStart().Substring(DbKeywords.Throw.Length).Trim().TrimEnd(';');
                 var throwStmt = new ThrowStatement();
                 if (expr.Contains("("))
                 {
-                    var m = Regex.Match(expr, @"(\w+)\((.*)\)");
-                    if (m.Success)
-                    {
-                        throwStmt.ExceptionType = m.Groups[1].Value;
-                        throwStmt.Arguments = m.Groups[2].Value;
-                    }
+                    // Extract exception type and arguments using ExtractParenContent
+                    int parenIdx = expr.IndexOf('(');
+                    throwStmt.ExceptionType = expr.Substring(0, parenIdx).Trim();
+                    string argsContent = ExtractParenContent(expr);
+                    throwStmt.Arguments = argsContent;
                 }
                 else throwStmt.ExceptionType = expr;
                 body.Add(throwStmt);
@@ -1882,7 +2403,7 @@ namespace taste.Parse.Db
             else if (StartsWithKeyword(line, DbKeywords.Log))
             {
                 // Parse: log <stream> for <messageType> <payload>;
-                string logExpr = line.Substring(DbKeywords.Log.Length + 1).Trim().TrimEnd(';');
+                string logExpr = line.TrimStart().Substring(DbKeywords.Log.Length).Trim().TrimEnd(';');
                 int forKeywordIdx = logExpr.IndexOf(" for ");
                 if (forKeywordIdx >= 0)
                 {
@@ -1891,6 +2412,8 @@ namespace taste.Parse.Db
 
                     // rest is: "MessageType.Debug payload" or "MessageType.Debug"
                     // Find the MessageType.X part — it's the first token that contains a dot or is a single word
+                    // The payload may contain spaces, parens, etc. so we need to find the boundary carefully.
+                    // MessageType can be: Type.Level, Type, or qualified like Namespace.Type.Level
                     int spaceIdx = rest.IndexOf(' ');
                     string messageType;
                     string payload = "";
@@ -1926,9 +2449,10 @@ namespace taste.Parse.Db
             }
             else if (line.StartsWith(DbKeywords.Swap + "("))
             {
-                var sm = Regex.Match(line, @"swap\(([^,]+),\s*([^)]+)\)");
-                if (sm.Success)
-                    body.Add(new SwapStatement(sm.Groups[1].Value.Trim(), sm.Groups[2].Value.Trim()));
+                string swapContent = ExtractParenContent(line);
+                var swapParts = SplitTopLevelCommas(swapContent ?? "");
+                if (swapParts.Count == 2)
+                    body.Add(new SwapStatement(swapParts[0].Trim(), swapParts[1].Trim()));
             }
 
             // ── Move: var b <- a; or b <- a; ─────────────────────────────────
@@ -2186,6 +2710,51 @@ namespace taste.Parse.Db
         }
 
         /// <summary>
+        /// Extracts the content inside the first set of balanced parentheses from a line.
+        /// Handles nested parens (e.g. for generic types like List&lt;int&gt;).
+        /// </summary>
+        private string ExtractParenContent(string line)
+        {
+            int start = line.IndexOf('(');
+            if (start < 0) return "";
+            int depth = 0;
+            for (int i = start; i < line.Length; i++)
+            {
+                if (line[i] == '(') depth++;
+                else if (line[i] == ')')
+                {
+                    depth--;
+                    if (depth == 0)
+                        return line.Substring(start + 1, i - start - 1);
+                }
+            }
+            // Unbalanced — return everything after the opening paren
+            return line.Substring(start + 1);
+        }
+
+        /// <summary>
+        /// Finds the index of the nth semicolon at depth 0 (outside parens/brackets/braces/strings).
+        /// Returns -1 if not found.
+        /// </summary>
+        private int FindTopLevelSemicolon(string s, int startIndex)
+        {
+            int depth = 0;
+            bool inStr = false, inChar = false;
+            for (int i = startIndex; i < s.Length; i++)
+            {
+                char c = s[i];
+                if (inStr) { if (c == '\\' && i + 1 < s.Length) i++; else if (c == '"') inStr = false; continue; }
+                if (inChar) { if (c == '\\' && i + 1 < s.Length) i++; else if (c == '\'') inChar = false; continue; }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '\'') { inChar = true; continue; }
+                if (c == '(' || c == '[' || c == '{' || c == '<') depth++;
+                else if (c == ')' || c == ']' || c == '}' || c == '>') depth--;
+                else if (c == ';' && depth == 0) return i;
+            }
+            return -1;
+        }
+
+        /// <summary>
         /// Finds the index of the first <c>=</c> at depth 0 that is not part of
         /// <c>==</c>, <c>!=</c>, <c>&lt;=</c>, <c>&gt;=</c>, or <c>=&gt;</c>.
         /// Returns -1 if none found.
@@ -2216,14 +2785,47 @@ namespace taste.Parse.Db
             return -1;
         }
 
+        /// <summary>
+        /// Counts the net brace depth change in a line, ignoring braces inside
+        /// string and char literals. Returns positive for net opening braces,
+        /// negative for net closing braces, zero if balanced or none.
+        /// </summary>
+        private int CountBraces(string line)
+        {
+            int depth = 0;
+            bool inStr = false, inChar = false;
+            for (int i = 0; i < line.Length; i++)
+            {
+                char c = line[i];
+                if (inStr) { if (c == '\\' && i + 1 < line.Length) i++; else if (c == '"') inStr = false; continue; }
+                if (inChar) { if (c == '\\' && i + 1 < line.Length) i++; else if (c == '\'') inChar = false; continue; }
+                if (c == '"') { inStr = true; continue; }
+                if (c == '\'') { inChar = true; continue; }
+                if (c == '{') depth++;
+                else if (c == '}') depth--;
+            }
+            return depth;
+        }
+
         private void ParseVariable(List<Variable> variables, string line)
         {
             // Strip trailing semicolon and access modifiers
             string trimmed = line.Trim().TrimEnd(';');
             trimmed = System.Text.RegularExpressions.Regex.Replace(trimmed, @"^(public|private|protected|internal)\s+", "");
 
-            // Pattern: Type name = expr;
-            var assignMatch = System.Text.RegularExpressions.Regex.Match(trimmed, @"^(\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*=\s*(.+)$");
+            // Strip ref/out/in/params modifiers
+            bool isRef = false, isOut = false, isIn = false;
+            if (trimmed.StartsWith("ref ")) { isRef = true; trimmed = trimmed.Substring(4).TrimStart(); }
+            else if (trimmed.StartsWith("out ")) { isOut = true; trimmed = trimmed.Substring(4).TrimStart(); }
+            else if (trimmed.StartsWith("in ")) { isIn = true; trimmed = trimmed.Substring(3).TrimStart(); }
+
+            // Strip readonly/const modifiers
+            bool isReadonly = false, isConst = false;
+            if (trimmed.StartsWith("readonly ")) { isReadonly = true; trimmed = trimmed.Substring(9).TrimStart(); }
+            if (trimmed.StartsWith("const ")) { isConst = true; trimmed = trimmed.Substring(6).TrimStart(); }
+
+            // Pattern: Type name = expr;  (handles qualified types like NS.Type and generics like Dictionary<string, int>)
+            var assignMatch = System.Text.RegularExpressions.Regex.Match(trimmed, @"^((?:\w+\.)*\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*=\s*(.+)$");
             if (assignMatch.Success)
             {
                 string type = assignMatch.Groups[1].Value;
@@ -2231,6 +2833,11 @@ namespace taste.Parse.Db
                 string initExpr = assignMatch.Groups[3].Value.Trim();
 
                 var v = new Variable(name, type) { Initializer = initExpr };
+                if (isRef) v.Modifier = "ref";
+                if (isOut) v.Modifier = "out";
+                if (isIn) v.Modifier = "in";
+                if (isReadonly) v.Mutability = MutabilityModifier.ReadOnly;
+                if (isConst) v.Mutability = MutabilityModifier.Const;
 
                 // Try to parse the initializer as an expression
                 var parsedInit = _exprParser.ParseExpression(initExpr);
@@ -2254,6 +2861,8 @@ namespace taste.Parse.Db
                 string initExpr = varMatch.Groups[2].Value.Trim();
 
                 var v = new Variable(name, "var") { Initializer = initExpr, IsInferred = true };
+                if (isRef) v.Modifier = "ref";
+                if (isOut) v.Modifier = "out";
 
                 var parsedInit = _exprParser.ParseExpression(initExpr);
                 if (parsedInit is ObjectCreationExpression objCreate)
@@ -2268,11 +2877,17 @@ namespace taste.Parse.Db
                 return;
             }
 
-            // Pattern: Type name; (declaration without initializer)
-            var simpleMatch = System.Text.RegularExpressions.Regex.Match(trimmed, @"^(\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*$");
+            // Pattern: Type name; (declaration without initializer — handles qualified/generic types)
+            var simpleMatch = System.Text.RegularExpressions.Regex.Match(trimmed, @"^((?:\w+\.)*\w+(?:<[^>]+>)?(?:\[\])?)\s+(\w+)\s*$");
             if (simpleMatch.Success)
             {
-                variables.Add(new Variable(simpleMatch.Groups[2].Value, simpleMatch.Groups[1].Value));
+                var v = new Variable(simpleMatch.Groups[2].Value, simpleMatch.Groups[1].Value);
+                if (isRef) v.Modifier = "ref";
+                if (isOut) v.Modifier = "out";
+                if (isIn) v.Modifier = "in";
+                if (isReadonly) v.Mutability = MutabilityModifier.ReadOnly;
+                if (isConst) v.Mutability = MutabilityModifier.Const;
+                variables.Add(v);
                 return;
             }
 
