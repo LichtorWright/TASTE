@@ -1,5 +1,6 @@
 # taste
-taste is essentially a compiler that can compile itself into any language it supports.
+taste is a compiler that can compile itself into any language it supports by emission. It's a way to serialize code constructs. A code rosetta stone.
+
 
 ## taste — Transpiling Abstract Syntax Tree Emission
 
@@ -56,3 +57,6 @@ The pipeline looks like this:
 
 ```text
 Source Parser → MAST → AST → Emitter → Target Code
+```
+
+An eventual goal aims to give AI a way to think in programming structures, rather than a "language"..
